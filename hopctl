@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+CONFIG_DIR=${HOPCTL_CONFIG_DIR:-/etc/hopctl}
+RULES_FILE="$CONFIG_DIR/rules.tsv"
+LOCK_FILE=${HOPCTL_LOCK_FILE:-/run/lock/hopctl.lock}
+CHAIN=HOPCTL
+IPT4=${HOPCTL_IPTABLES4:-iptables}
+IPT6=${HOPCTL_IPTABLES6:-ip6tables}
+FLOCK=${HOPCTL_FLOCK:-flock}
+
+say() { printf '%s\n' "$*"; }
+err() { printf '错误：%s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+require_root() {
+  if [[ ${HOPCTL_TEST_MODE:-0} != 1 && $EUID -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      exec sudo -- "$0" "$@"
+    fi
+    die '请使用 root 身份运行；当前系统未安装 sudo。'
+  fi
+}
+
+require_tools() {
+  local tool
+  for tool in "$IPT4" "$IPT6" "$FLOCK" mktemp awk; do
+    command -v "$tool" >/dev/null 2>&1 || die "缺少命令：$tool。请先运行安装脚本。"
+  done
+}
+
+init_storage() {
+  mkdir -p "$CONFIG_DIR" "$(dirname "$LOCK_FILE")"
+  chmod 700 "$CONFIG_DIR"
+  if [[ ! -e $RULES_FILE ]]; then
+    : > "$RULES_FILE"
+    chmod 600 "$RULES_FILE"
+  fi
+}
+
+lock() {
+  exec {LOCK_FD}>"$LOCK_FILE"
+  "$FLOCK" -x "$LOCK_FD"
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+parse_range() {
+  local input=$1
+  [[ $input =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]] || return 1
+  local first=${BASH_REMATCH[1]} last=${BASH_REMATCH[3]:-}
+  valid_port "$first" || return 1
+  RANGE_START=$((10#$first))
+  if [[ -n $last ]]; then
+    valid_port "$last" || return 1
+    RANGE_END=$((10#$last))
+  else
+    RANGE_END=$RANGE_START
+  fi
+  (( RANGE_START <= RANGE_END ))
+}
+
+valid_proto() { [[ $1 == udp || $1 == tcp || $1 == both ]]; }
+
+validate_file() {
+  local file=$1 id proto start end target extra old_id old_proto old_start old_end old_target
+  local -a seen_ids=() seen_protos=() seen_starts=() seen_ends=()
+  while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+    [[ -z ${id:-} ]] && continue
+    [[ $id =~ ^[1-9][0-9]*$ && -z ${extra:-} ]] || { err '配置文件格式错误。'; return 1; }
+    valid_proto "$proto" || { err "规则 #$id 的协议无效。"; return 1; }
+    valid_port "$start" && valid_port "$end" && valid_port "$target" && (( start <= end )) || {
+      err "规则 #$id 的端口无效。"; return 1;
+    }
+    for ((i=0; i<${#seen_ids[@]}; i++)); do
+      old_id=${seen_ids[i]}; old_proto=${seen_protos[i]}
+      old_start=${seen_starts[i]}; old_end=${seen_ends[i]}
+      [[ $id != "$old_id" ]] || { err "规则 #$id 重复。"; return 1; }
+      if [[ $proto == both || $old_proto == both || $proto == "$old_proto" ]]; then
+        if (( start <= old_end && end >= old_start )); then
+          err "规则 #$id 与 #$old_id 的端口范围重叠。"
+          return 1
+        fi
+      fi
+    done
+    seen_ids+=("$id"); seen_protos+=("$proto")
+    seen_starts+=("$start"); seen_ends+=("$end")
+  done < "$file"
+}
+
+rule_args() {
+  local id=$1 proto=$2 start=$3 end=$4 target=$5
+  local range=$start
+  [[ $start == "$end" ]] || range="$start:$end"
+  RULE_ARGS=(-p "$proto" -m "$proto" --dport "$range" -m comment --comment "hopctl:$id:$proto" -j REDIRECT --to-ports "$target")
+}
+
+ensure_chain() {
+  local bin=$1
+  if ! "$bin" -w 5 -t nat -S "$CHAIN" >/dev/null 2>&1; then
+    "$bin" -w 5 -t nat -N "$CHAIN" || { err "$bin 不支持 NAT 链，双栈部署中止。"; return 1; }
+  fi
+  if ! "$bin" -w 5 -t nat -C PREROUTING -j "$CHAIN" >/dev/null 2>&1; then
+    "$bin" -w 5 -t nat -I PREROUTING 1 -j "$CHAIN" || return 1
+  fi
+}
+
+sync_family() {
+  local bin=$1 file=$2 id proto start end target extra p actual expected=0 missing=0 drift=0
+  ensure_chain "$bin" || return 1
+  actual=$("$bin" -w 5 -t nat -S "$CHAIN" | awk '$1=="-A" && $2=="HOPCTL" {n++} END {print n+0}') || return 1
+  while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+    [[ -z ${id:-} ]] && continue
+    for p in udp tcp; do
+      [[ $proto == "$p" || $proto == both ]] || continue
+      ((expected+=1))
+      rule_args "$id" "$p" "$start" "$end" "$target"
+      "$bin" -w 5 -t nat -C "$CHAIN" "${RULE_ARGS[@]}" >/dev/null 2>&1 || ((missing+=1))
+    done
+  done < "$file"
+  if (( missing > 0 && actual + missing == expected )); then
+    drift=1
+    while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+      [[ -z ${id:-} ]] && continue
+      for p in udp tcp; do
+        [[ $proto == "$p" || $proto == both ]] || continue
+        rule_args "$id" "$p" "$start" "$end" "$target"
+        if ! "$bin" -w 5 -t nat -C "$CHAIN" "${RULE_ARGS[@]}" >/dev/null 2>&1; then
+          "$bin" -w 5 -t nat -A "$CHAIN" "${RULE_ARGS[@]}" || return 1
+        fi
+      done
+    done < "$file"
+  elif (( actual != expected || missing > 0 )); then
+    drift=1
+    "$bin" -w 5 -t nat -F "$CHAIN" || return 1
+    while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+      [[ -z ${id:-} ]] && continue
+      for p in udp tcp; do
+        [[ $proto == "$p" || $proto == both ]] || continue
+        rule_args "$id" "$p" "$start" "$end" "$target"
+        "$bin" -w 5 -t nat -A "$CHAIN" "${RULE_ARGS[@]}" || return 1
+      done
+    done < "$file"
+  fi
+  if (( drift )); then
+    say "$bin：$expected 条协议规则已修复。"
+  else
+    say "$bin：$expected 条协议规则已核对，无需重复部署。"
+  fi
+}
+
+sync_all() {
+  local file=$1
+  validate_file "$file" || return 1
+  sync_family "$IPT4" "$file" || return 1
+  sync_family "$IPT6" "$file" || return 1
+}
+
+apply_rules() {
+  lock
+  sync_all "$RULES_FILE" || die '规则校验失败；请检查 IPv4/IPv6 NAT 支持及错误信息。'
+}
+
+add_rule() {
+  local proto=$1 range=$2 target=$3 id=1 old_id old_proto old_start old_end old_target extra tmp
+  valid_proto "$proto" || die '协议只能是 udp、tcp 或 both。'
+  parse_range "$range" || die '端口范围应为 1-65535，例如 2000-2999。'
+  local start=$RANGE_START end=$RANGE_END
+  valid_port "$target" || die '服务端口应为 1-65535。'
+  target=$((10#$target))
+  lock
+  validate_file "$RULES_FILE" || die '现有配置无效，未添加规则。'
+  while IFS=$'\t' read -r old_id old_proto old_start old_end old_target extra || [[ -n ${old_id:-} ]]; do
+    [[ -z ${old_id:-} ]] && continue
+    if (( old_id >= id )); then id=$((old_id+1)); fi
+    if [[ $proto == "$old_proto" && $start == "$old_start" && $end == "$old_end" && $target == "$old_target" ]]; then
+      say "相同规则已存在：#$old_id；正在核对系统规则。"
+      sync_all "$RULES_FILE" || die '规则校验失败。'
+      return
+    fi
+  done < "$RULES_FILE"
+  tmp=$(mktemp "$CONFIG_DIR/.rules.XXXXXX")
+  cat "$RULES_FILE" > "$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$proto" "$start" "$end" "$target" >> "$tmp"
+  if ! sync_all "$tmp"; then
+    rm -f "$tmp"
+    sync_all "$RULES_FILE" >&2 || true
+    die '双栈应用失败，配置未保存。'
+  fi
+  mv -f "$tmp" "$RULES_FILE"
+  chmod 600 "$RULES_FILE"
+  say "已添加 #$id：$proto 公网端口 $start-$end → 本机服务端口 $target。"
+}
+
+delete_rule() {
+  local wanted=$1 id proto start end target extra tmp found=0
+  [[ $wanted =~ ^[1-9][0-9]*$ ]] || die '请输入列表中的规则编号。'
+  lock
+  validate_file "$RULES_FILE" || die '现有配置无效，未删除规则。'
+  tmp=$(mktemp "$CONFIG_DIR/.rules.XXXXXX")
+  while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+    [[ -z ${id:-} ]] && continue
+    if [[ $id == "$wanted" ]]; then found=1; continue; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$proto" "$start" "$end" "$target" >> "$tmp"
+  done < "$RULES_FILE"
+  if (( !found )); then rm -f "$tmp"; die "未找到 #$wanted。"; fi
+  if ! sync_all "$tmp"; then
+    rm -f "$tmp"
+    sync_all "$RULES_FILE" >&2 || true
+    die '删除应用失败，配置未保存。'
+  fi
+  mv -f "$tmp" "$RULES_FILE"
+  chmod 600 "$RULES_FILE"
+  say "已删除 #$wanted。"
+}
+
+list_rules() {
+  local id proto start end target extra count=0
+  local jump4=0 jump6=0
+  "$IPT4" -w 5 -t nat -C PREROUTING -j "$CHAIN" >/dev/null 2>&1 && jump4=1
+  "$IPT6" -w 5 -t nat -C PREROUTING -j "$CHAIN" >/dev/null 2>&1 && jump6=1
+  printf '%-6s %-9s %-15s %-12s %-9s %-9s\n' '编号' '协议' '公网端口' '服务端口' 'IPv4' 'IPv6'
+  while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
+    [[ -z ${id:-} ]] && continue
+    ((count+=1))
+    local s4=正常 s6=正常 p
+    for p in udp tcp; do
+      [[ $proto == "$p" || $proto == both ]] || continue
+      rule_args "$id" "$p" "$start" "$end" "$target"
+      if (( jump4 )); then
+        "$IPT4" -w 5 -t nat -C "$CHAIN" "${RULE_ARGS[@]}" >/dev/null 2>&1 || s4=缺失
+      else s4=缺失; fi
+      if (( jump6 )); then
+        "$IPT6" -w 5 -t nat -C "$CHAIN" "${RULE_ARGS[@]}" >/dev/null 2>&1 || s6=缺失
+      else s6=缺失; fi
+    done
+    printf '%-6s %-9s %-15s %-12s %-9s %-9s\n' "$id" "$proto" "$start-$end" "$target" "$s4" "$s6"
+  done < "$RULES_FILE"
+  (( count > 0 )) || say '当前没有转发规则。'
+}
+
+menu() {
+  local choice proto range target id
+  while true; do
+    say '' '====== hopctl 端口跳跃面板 ======' \
+      '1) 添加规则' '2) 查看规则和双栈状态' '3) 按编号删除规则' \
+      '4) 立即校验并修复' '0) 退出'
+    read -r -p '请选择：' choice || return
+    case $choice in
+      1)
+        read -r -p '协议 [udp/tcp/both，回车默认 udp]：' proto || return
+        proto=${proto:-udp}
+        read -r -p '公网端口或范围（如 2000-2999）：' range || return
+        read -r -p '本机服务端口（如 4443）：' target || return
+        (add_rule "$proto" "$range" "$target") || true
+        ;;
+      2) list_rules ;;
+      3)
+        list_rules
+        read -r -p '要删除的编号（回车取消）：' id || return
+        [[ -z $id ]] || (delete_rule "$id") || true
+        ;;
+      4) (apply_rules) || true ;;
+      0) return ;;
+      *) err '无效选项。' ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+用法：
+  sudo hopctl                     打开交互面板
+  sudo hopctl add udp 2000-2999 4443
+  sudo hopctl add tcp 10000 443
+  sudo hopctl add both 2000-2999 4443
+  sudo hopctl list                查看规则及双栈状态
+  sudo hopctl delete 编号         仅清理指定规则
+  sudo hopctl apply               幂等校验并修复规则
+EOF
+}
+
+main() {
+  require_root "$@"
+  require_tools
+  init_storage
+  case ${1:-menu} in
+    menu) [[ $# -eq 0 || $# -eq 1 ]] || die 'menu 无需参数。'; menu ;;
+    add) [[ $# -eq 4 ]] || die '用法：hopctl add udp|tcp|both 端口范围 服务端口'; add_rule "$2" "$3" "$4" ;;
+    delete|remove) [[ $# -eq 2 ]] || die '用法：hopctl delete 编号'; delete_rule "$2" ;;
+    list|status) [[ $# -eq 1 ]] || die 'list 无需参数。'; list_rules ;;
+    apply) [[ $# -eq 1 ]] || die 'apply 无需参数。'; apply_rules ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
