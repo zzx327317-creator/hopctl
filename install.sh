@@ -7,7 +7,10 @@ CONFIG_DIR=/etc/hopctl
 SCRIPT_NAME=hopctl
 
 die() { printf '安装失败：%s\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || die '请以 root 运行，例如 sudo bash install.sh。'
+if [[ $EUID -ne 0 ]]; then
+  command -v sudo >/dev/null 2>&1 || die '需要 root 权限；当前系统未安装 sudo。'
+  exec sudo -- bash "${BASH_SOURCE[0]}" "$@"
+fi
 [[ $(uname -s) == Linux ]] || die '仅支持使用 systemd 的 Linux 服务器。'
 command -v systemctl >/dev/null 2>&1 || die '未发现 systemd。'
 
