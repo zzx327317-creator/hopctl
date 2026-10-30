@@ -4,11 +4,10 @@
 
 ## 一键安装
 
-主要适配 **Debian + systemd**。在 Debian 服务器上以 root 或 sudo 执行：
+主要适配 **Debian + systemd**。在 Debian 服务器终端复制下面整行执行，安装完成后会自动打开面板：
 
 ```bash
-curl -fsSLo /tmp/install-hopctl.sh https://raw.githubusercontent.com/zzx327317-creator/hopctl/main/install.sh
-sudo bash /tmp/install-hopctl.sh
+curl -fsSLo /tmp/install-hopctl.sh https://raw.githubusercontent.com/zzx327317-creator/hopctl/main/install.sh && sudo bash /tmp/install-hopctl.sh
 ```
 
 安装脚本会检查并安装 `iptables` / `ip6tables` / `flock`，安装 `hopctl` 命令，创建 systemd 服务与复核定时器。执行完毕会打开交互面板。也可下载仓库后在目录内运行 `sudo bash install.sh`。
