@@ -13,7 +13,7 @@ IPT4=${HOPCTL_IPTABLES4:-iptables}
 IPT6=${HOPCTL_IPTABLES6:-ip6tables}
 FLOCK=${HOPCTL_FLOCK:-flock}
 
-say() { printf '%s\n' "$*"; }
+say() { printf '%s\n' "$@"; }
 err() { printf '错误：%s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 
@@ -226,7 +226,7 @@ list_rules() {
   local jump4=0 jump6=0
   "$IPT4" -w 5 -t nat -C PREROUTING -j "$CHAIN" >/dev/null 2>&1 && jump4=1
   "$IPT6" -w 5 -t nat -C PREROUTING -j "$CHAIN" >/dev/null 2>&1 && jump6=1
-  printf '%-6s %-9s %-15s %-12s %-9s %-9s\n' '编号' '协议' '公网端口' '服务端口' 'IPv4' 'IPv6'
+  say '' '------ 当前转发规则 ------'
   while IFS=$'\t' read -r id proto start end target extra || [[ -n ${id:-} ]]; do
     [[ -z ${id:-} ]] && continue
     ((count+=1))
@@ -241,17 +241,24 @@ list_rules() {
         "$IPT6" -w 5 -t nat -C "$CHAIN" "${RULE_ARGS[@]}" >/dev/null 2>&1 || s6=缺失
       else s6=缺失; fi
     done
-    printf '%-6s %-9s %-15s %-12s %-9s %-9s\n' "$id" "$proto" "$start-$end" "$target" "$s4" "$s6"
+    printf '  [%s] %s\n' "$id" "${proto^^}"
+    printf '      公网端口：%s\n' "$start-$end"
+    printf '      服务端口：%s\n' "$target"
+    printf '      IPv4：%s   IPv6：%s\n\n' "$s4" "$s6"
   done < "$RULES_FILE"
-  (( count > 0 )) || say '当前没有转发规则。'
+  (( count > 0 )) || say '  当前没有转发规则。'
 }
 
 menu() {
   local choice proto range target id
   while true; do
-    say '' '====== hopctl 端口跳跃面板 ======' \
-      '1) 添加规则' '2) 查看规则和双栈状态' '3) 按编号删除规则' \
-      '4) 立即校验并修复' '0) 退出'
+    say '' '====== hopctl 端口跳跃 ======' \
+      '  1) 添加转发规则' \
+      '  2) 查看规则状态' \
+      '  3) 删除指定规则' \
+      '  4) 校验并修复规则' \
+      '  0) 退出' \
+      '============================='
     read -r -p '请选择：' choice || return
     case $choice in
       1)

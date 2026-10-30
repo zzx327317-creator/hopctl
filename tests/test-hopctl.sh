@@ -71,6 +71,15 @@ for family in mock-iptables mock-ip6tables; do
   [[ $(grep -c 'hopctl:2:' "$tmp/fw/$family/rules") -eq 2 ]]
 done
 
+menu_output=$(printf '2\n0\n' | bash "$root/hopctl")
+grep -Fxq '  1) 添加转发规则' <<< "$menu_output"
+grep -Fxq '  2) 查看规则状态' <<< "$menu_output"
+grep -Fxq '  3) 删除指定规则' <<< "$menu_output"
+grep -Fxq '  4) 校验并修复规则' <<< "$menu_output"
+grep -Fxq '  0) 退出' <<< "$menu_output"
+grep -Fxq '      公网端口：2000-2999' <<< "$menu_output"
+grep -Fxq '      服务端口：4443' <<< "$menu_output"
+
 if bash "$root/hopctl" add udp 2500-3500 4443 >/dev/null 2>&1; then
   echo 'overlap accepted' >&2; exit 1
 fi
